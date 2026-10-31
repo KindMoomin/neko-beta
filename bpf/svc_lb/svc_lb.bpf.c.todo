@@ -1,0 +1,13 @@
+/* svc_lb — BPF_CGROUP_INET4_CONNECT Service load-balancer (skeleton).
+ *
+ * NOT built in this skeleton. See ../README.md. This file marks the program's
+ * shape and home; the real implementation (C/libbpf+CO-RE or Rust/aya) lands at
+ * the dataplane milestone.
+ *
+ * Intended attach: BPF_CGROUP_INET4_CONNECT (+ INET6_CONNECT, UDP SENDMSG/RECVMSG,
+ * GETSOCKNAME) on the node-container cgroup.
+ * Map: svc_lb  key={clusterIP,port,proto} -> value=[backend{ip,port}]  (written from Go).
+ * Action: at connect(), rewrite ctx->user_ip4/user_port to a selected backend.
+ */
+
+/* placeholder — see README.md for the design */
