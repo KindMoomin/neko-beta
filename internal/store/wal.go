@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/neko-box/neko/internal/api"
@@ -46,6 +47,11 @@ type wal struct {
 
 // openWAL opens or creates the WAL at path for append, creating parent dirs.
 func openWAL(path string, mode SyncMode) (*wal, error) {
+	if dir := filepath.Dir(path); dir != "." && dir != "/" {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return nil, fmt.Errorf("create wal dir %s: %w", dir, err)
+		}
+	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open wal %s: %w", path, err)
@@ -139,22 +145,9 @@ func (w *wal) close() error {
 
 // decodeObject turns a tagged raw JSON record back into the concrete api type.
 func decodeObject(kind string, raw json.RawMessage) (api.Object, error) {
-	var obj api.Object
-	switch kind {
-	case "Pod":
-		obj = &api.Pod{}
-	case "Namespace":
-		obj = &api.Namespace{}
-	case "Deployment":
-		obj = &api.Deployment{}
-	case "ReplicaSet":
-		obj = &api.ReplicaSet{}
-	case "Service":
-		obj = &api.Service{}
-	case "EndpointSlice":
-		obj = &api.EndpointSlice{}
-	default:
-		return nil, fmt.Errorf("wal: unknown kind %q", kind)
+	obj, err := api.New(kind)
+	if err != nil {
+		return nil, fmt.Errorf("wal: %w", err)
 	}
 	if err := json.Unmarshal(raw, obj); err != nil {
 		return nil, fmt.Errorf("wal unmarshal %s: %w", kind, err)

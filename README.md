@@ -4,7 +4,32 @@ A lightweight, local, Kubernetes-**shaped** container runtime for developer
 laptops — like `kind`/`minikube`, but aggressively slimmed for small-RAM
 machines. **Not** a conformant Kubernetes distribution.
 
-> Status: **design phase.** No runnable code yet. See [`docs/`](docs/).
+> Status: **M1 works — a pod actually runs.** `neko up` provisions a node (via
+> kind, no kubeadm), and `neko apply` of a TOML Pod starts a real container with
+> a pod IP, reported back through neko-box's own API. The eBPF dataplane
+> (Service LB + RTT), Deployments/Services, and DNS are the next steps. See
+> [`docs/`](docs/).
+
+## Run a pod
+
+```sh
+go build -o neko ./cmd/neko
+GOOS=linux GOARCH=arm64 go build -o neko-linux ./cmd/neko   # the in-node binary
+
+# provision a node (kind-provisioned container; neko's own control plane inside)
+./neko up --port 7443 --neko-bin ./neko-linux
+
+# author a Pod in TOML and apply it
+./neko apply examples/pod.toml       # Pod/hello created
+./neko get Pod                       # default/hello  — reaches phase=Running with a podIP
+./neko delete Pod hello              # stops the container
+
+./neko down                          # tear the node down
+```
+
+`neko apply` → the store → the kubelet creates a sandbox (containerd + CNI
+assign the IP) → pulls and starts the container → reports `Running` + `podIP`.
+
 
 ## The idea in one paragraph
 

@@ -96,11 +96,119 @@ synthesize") at `opus high`, per `~/.claude/rules/pstack-models.md`.
         across reopen (create/update/delete all replay correctly).
       - `access.InProc`: implemented + round-trip test; maps the seam's
         revision-on-object convention to the store's `expectedRevision` arg.
-- [ ] Next up (M1 continuation):
-      - `httpapi`: wire the `/v1` REST + SSE-watch surface over the store.
-      - `clientcmd` + `cmd/neko` client verbs: `apply`/`get`/`delete` over HTTP.
-      - `cri` (CRI-gRPC) + `cni`/`ipam` + minimal `kubelet`: actually run a pod.
-      - `neko up`/`node-agent` bring-up + the platform preflight.
+      - `api.New(kind)`: single kind→type constructor; WAL decode now reuses it
+        (removed the duplicated switch), and `httpapi` request-decode uses it too.
+      - `httpapi`: the full `/v1` external seam over the store — list/get/create
+        (POST)/replace (PUT `?rev=`)/delete + SSE watch (`?watch=1&since=`) +
+        healthz. Go 1.26 `ServeMux` pattern routing; optimistic concurrency maps
+        to 409. Tested end-to-end via `httptest`: CRUD, CAS, duplicate/stale
+        conflicts, and watch replay+live — all under `-race`.
+      - `clientcmd` + `cmd/neko`: TOML-native client (`apply`/`get`/`delete`) over
+        HTTP, and a runnable `neko node-agent` serving the store over httpapi.
+        TOML decodes via TOML→map→JSON→api type (one source of truth: the json
+        tags). `apply` is idempotent (GET probe → POST create or CAS PUT).
+      - **End-to-end verified against the real binary:** `neko node-agent` +
+        `neko apply examples/pod.toml` → created → `get` renders it →
+        re-`apply` → configured → `delete` → gone; and WAL **durability across
+        agent restart** (state replays from disk). Added `BurntSushi/toml` dep.
+- [ ] Next up (M1 continuation): the real-pod path, now that the control-plane
+      spine runs end to end —
+      - [x] **`cri` (CRI-gRPC to containerd) — implemented + live-smoked.**
+        Decisions D9 (containerd/CRI-gRPC) + D10 (youki OCI, deferred to node
+        image; M1 runs on runc). `internal/cri` connects, pulls images, creates
+        sandboxes with the correct systemd cgroup parent. Live smoke against
+        `kindest/node:v1.31.2` (harness `hack/crismoke.go`) surfaced and fixed
+        the systemd-cgroup-parent requirement, and located two node-bring-up
+        requirements (fuse-overlayfs snapshotter, CNI-config-before-sandbox) —
+        recorded in `PLATFORM.md` M4. Added `k8s.io/cri-api` + `grpc` deps.
+      - [x] **`cni` + minimal `kubelet` — DONE. A pod actually runs now.**
+        M1 networking model: pod networking is done by containerd's CRI plugin
+        driving the CNI conflist `neko up` installs — the kubelet does NOT build
+        veth/netns by hand (that fights containerd). So `cni` shrank to owning
+        the conflist (`cni.Conflist`/`ConflistPath`, reused by `neko up` — dedup);
+        the hand-rolled `Network`/`ipam` veth path was removed as the wrong
+        abstraction for the CRI model. `kubelet` watches Pods bound to this node,
+        creates the sandbox (containerd+CNI assign the IP via `cri.SandboxIP`),
+        pulls+starts containers, writes `Running`+PodIP back with CAS retry, and
+        tears down on delete. `node-agent` now wires kubelet + a trivial binder
+        (placement D5: bind unbound Pods to this node) when a CRI endpoint is
+        reachable (API-only otherwise).
+      - [x] **M1 GOAL MET — end to end verified:** `neko up` → `neko apply
+        examples/pod.toml` → pod reaches **`phase=Running ip=10.244.0.2`** with a
+        **real nginx:alpine container running** in the node (crictl: sandbox
+        Ready, container Running); `neko delete` tears it down (0 containers).
+      - [ ] `neko up`/`down` — DONE (see D11 above).
+      - [x] **`neko up`/`down` — implemented + working via kind provisioning (D11).**
+        `internal/node` uses kind's Go library to provision the kindest/node
+        container (stopping before kubeadm), installs the CNI conflist, copies a
+        linux `neko` binary in, and launches `neko node-agent`. **Verified end to
+        end:** `neko up` (~8s) → agent healthy on the published host port →
+        `neko apply`/`get` round-trip host→node → **CRI smoke passes on our own
+        node** (`CRI SMOKE OK`: sandbox→container→teardown). Added `sigs.k8s.io/kind`.
+
+### Known blocker (M4) — RESOLVED via kind provisioning (D11)
+**Resolved 2026-10-31.** `neko up` now delegates node provisioning to kind's Go
+library (`cluster.Create` + `CreateWithStopBeforeSettingUpKubernetes(true)`):
+kind builds the kindest/node container correctly (the overlay/containerd/mount
+setup our hand-rolled `docker run` couldn't replicate) and stops before kubeadm;
+we install the CNI conflist, copy the `neko` binary in, and launch
+`neko node-agent`. **Verified end to end:** `neko up` (~8s) → agent healthy on
+the published host port → `neko apply examples/pod.toml` → Pod created, AND the
+CRI smoke (`hack/crismoke.go`) now prints `CRI SMOKE OK` on our own node
+(sandbox→container→teardown). The container runtime path works.
+
+Tracked follow-up (not required for M1): remove the kind dependency with a
+self-contained bring-up once the overlay-snapshotter provisioning gap is
+understood. Diagnosis + disproven hypotheses retained below for that effort.
+
+### Historical diagnosis (kept for the self-contained-bringup follow-up)
+- **A CRI sandbox's pause task won't stay running in our bare-booted node.**
+  `RunPodSandbox` creates the sandbox record, CNI succeeds (netns + IP
+  `10.244.0.2` confirmed in containerd debug logs), but the pause **task** exits
+  immediately → sandbox `NotReady`, pid 0 → `StartContainer` can't join its
+  namespaces.
+- **Diagnosis (thorough, 2026-10-31):**
+  - Reproduces identically with `crictl runp` (containerd's own reference
+    client) — so it is **NOT our Go code**.
+  - `ctr run` of the **same pause:3.10 image** works fine → runtime, runc,
+    snapshotter (fuse-overlayfs), image, and arch are all healthy.
+  - Ruled OUT the cgroup driver: fails the same under both `SystemdCgroup=true`
+    (systemd slice created + active) and `SystemdCgroup=false` (cgroupfs).
+  - Ruled OUT cgroup-parent format, namespace options, missing container command.
+  - **Conclusion:** the gap is specific to the containerd **CRI-plugin shim path**
+    in this bare-booted node. `ctr` (direct) works; CRI (shim) doesn't. A real
+    `kind create cluster` configures the node beyond booting the container
+    (kubeadm-level setup); our `neko up` boots the container correctly but stops
+    short of that. This is a **node-provisioning gap, not a neko-box code bug.**
+- **Next step (focused):** compare a *working* CRI node (spin up a real
+  `kind create cluster`, confirm `crictl runp` works there) against ours, and
+  diff the containerd/CRI config + node setup. The delta is the fix for
+  `neko up`. If the delta is large, consider: run the agent's kubelet so it does
+  the sandbox setup kubelet-style, or build a purpose-made node image.
+
+### Update 2026-10-31 (deep dive) — code CONFIRMED correct; blocker narrowed
+- **Our `cri` code works end to end** on a real kind node (`kindest/node:v1.33.1`,
+  containerd v2.1.1): `hack/crismoke.go` ran sandbox→container→teardown and
+  printed `CRI SMOKE OK`. So the problem is 100% our own node bring-up.
+- **Bumped `neko up` default image to `kindest/node:v1.33.1`** and matched kind's
+  docker flags exactly (verified by inspecting the user's working kind node:
+  privileged, cgroupns=private, seccomp/apparmor/**label=disable**,
+  tmpfs /run+/tmp, only /lib/modules bind; **no** forced fuse-overlayfs, **no**
+  /dev/fuse, **no** /var volume — all of which I had wrongly added).
+- **On our own `neko up` node the CRI sandbox still fails** at the overlay
+  snapshot rootfs mount: `failed to mount rootfs component: invalid argument`.
+- **Hypotheses tested and DISPROVEN** (don't repeat): cgroup driver (fails under
+  both systemd & cgroupfs); image/containerd version (v1.33.1/containerd-2.1.1
+  same as working node); layer depth (single-layer pause also fails); manual
+  `mount -t overlay` works (incl. userxattr & metacopy variants); recursive
+  read-only (rro) mounts — making sandbox root writable did NOT help.
+- **Residual cause:** some difference in how containerd's overlayfs *snapshotter*
+  mounts inside our bare-booted container vs a kind-*provisioned* one. A manual
+  overlay mounts fine; containerd's snapshot overlay mount returns EINVAL.
+- **Recommended path forward:** since the code is proven and the gap is purely
+  node provisioning, strongly reconsider the parked option — let `kind` (or
+  kind's provisioning steps) create the node and run `neko node-agent` inside it
+  — rather than keep reverse-engineering kind's overlay bring-up by hand.
 
 ### Not committed
 No git commits yet (repo has no history/branch; awaiting go-ahead to commit).

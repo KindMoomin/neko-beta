@@ -46,14 +46,50 @@ program first loads, not a platform risk.
 
 ## M4 — Node image, cgroup driver, CIDR, CRI protocol (decided)
 
+> **Verified by live smoke (2026-10-31)** against `kindest/node:v1.31.2` +
+> containerd v1.7.18. The `internal/cri` client connects, pulls images, and
+> creates sandboxes correctly. The smoke harness is `hack/crismoke.go`
+> (`//go:build ignore`; build for linux/arm64, copy into a node, run). Three
+> concrete nested-container requirements surfaced — each is a **node bring-up**
+> concern (what `neko up` must do), not a `cri` code concern:
+>
+> 1. **Snapshotter must be `fuse-overlayfs`** (or `native`) when nested —
+>    overlayfs-on-overlayfs fails ("failed to mount rootfs component"). kind's
+>    node entrypoint auto-selects this; `neko up` must too, e.g. set
+>    `KIND_EXPERIMENTAL_CONTAINERD_SNAPSHOTTER=fuse-overlayfs` or run the node's
+>    own entrypoint rather than a bare `docker run`.
+> 2. **Cgroup parent must be systemd-slice form** (`*.slice`) because the node
+>    runs containerd with `SystemdCgroup=true` — a plain cgroupfs path makes runc
+>    reject the task. **Fixed in `cri.CreateSandbox`** (sets `Linux.CgroupParent`).
+> 3. **A CNI config must exist** in `/etc/cni/net.d` before any sandbox starts
+>    ("cni plugin not initialized" otherwise). kindest/node ships `ptp`,
+>    `host-local`, `loopback`, `portmap` (NOT `bridge`); the `neko` CNI installs
+>    its own conflist. Pod CIDR `10.244.0.0/16`.
+>
+> **Key lesson:** `neko up` cannot be a bare `docker run kindest/node` — that
+> skips kind's entrypoint node-setup (snapshotter select, mounts, a stable pause
+> process). `neko up` must either drive the kindest/node entrypoint the way kind
+> does, or build our own node image. A residual pause-process instability under
+> bare-run confirmed this is a bring-up problem, not a CRI-client problem.
+
 - **Node base image:** start from `kindest/node` (it already bundles containerd
   + runc + the nested-container mounts kind spent years getting right) OR a
   minimal Debian + containerd image. Decision: **reuse `kindest/node` for M1**
   to de-risk the nested-containerd integration; revisit a slimmer custom image
   once the spine works. (This directly retires M4's "biggest integration risk".)
-- **cgroup driver:** the VM is **cgroupfs**. Pin containerd's
-  `SystemdCgroup = false` to match — this avoids the classic cgroupfs-vs-systemd
-  nested start failure.
+  Verified `kindest/node:v1.31.2`: containerd **v1.7.18** with its CRI socket at
+  `/run/containerd/containerd.sock`, runc present, systemd as PID 1.
+- **cgroup driver:** `kindest/node` runs **systemd** and sets containerd's
+  `SystemdCgroup = true` (verified). So the kubelet must use the **systemd**
+  cgroup driver to match — NOT cgroupfs. (The VM kernel is cgroup **v2**
+  `cgroup2fs`; "v2" is the hierarchy, "systemd" is the driver — don't conflate
+  them. Earlier note said cgroupfs; corrected after probing the real image.)
+  The classic failure is a driver *mismatch* between kubelet and containerd, so
+  we align both on systemd.
+- **OCI runtime (D10 youki):** NOT present in stock `kindest/node` (only runc).
+  **M1 runs on the image's runc**; swapping in youki is a custom-node-image task
+  (install the youki binary + point containerd's `runtime_type`/`BinaryName` at
+  it) deferred to the node-image milestone. Our Go CRI code is unaffected.
 - **Pod CIDR `10.244.0.0/16`, Service CIDR `10.96.0.0/12`** — both free on this
   host (no `10.x` Docker networks; the collisions are all in `172.16/12` and
   `192.168.49/24`). `neko up` preflight also scans `docker network` and warns if
