@@ -1,0 +1,20 @@
+# A neko-native Deployment, authored in TOML (the native format — D3).
+# The deployment controller creates a ReplicaSet; the replicaset controller
+# creates Pods; the binder places them; the litterbox runs them.
+kind = "Deployment"
+apiVersion = "neko/v1"
+
+[metadata]
+name = "web"
+namespace = "default"
+
+[spec]
+replicas = 2
+
+[spec.selector]
+app = "web"
+
+[[spec.template.containers]]
+name = "web"
+image = "nginx:alpine"
+ports = [80]

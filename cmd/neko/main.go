@@ -25,9 +25,12 @@ import (
 	"github.com/neko-box/neko/internal/access"
 	"github.com/neko-box/neko/internal/api"
 	"github.com/neko-box/neko/internal/clientcmd"
+	"github.com/neko-box/neko/internal/controller"
+	"github.com/neko-box/neko/internal/controller/deployment"
+	"github.com/neko-box/neko/internal/controller/replicaset"
 	"github.com/neko-box/neko/internal/cri"
 	"github.com/neko-box/neko/internal/httpapi"
-	"github.com/neko-box/neko/internal/kubelet"
+	"github.com/neko-box/neko/internal/litterbox"
 	"github.com/neko-box/neko/internal/node"
 	"github.com/neko-box/neko/internal/store"
 )
@@ -91,7 +94,7 @@ func runNodeAgent(ctx context.Context, args []string) error {
 	addr := fs.String("addr", defaultAddr, "listen address for the API")
 	walPath := fs.String("wal", "", "WAL file path (empty = in-memory, no durability)")
 	nodeName := fs.String("node", "node0", "this node's name (pods bound here run here)")
-	criEndpoint := fs.String("cri-endpoint", "/run/containerd/containerd.sock", "containerd CRI socket (empty disables the kubelet)")
+	criEndpoint := fs.String("cri-endpoint", "/run/containerd/containerd.sock", "containerd CRI socket (empty disables the litterbox)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -105,20 +108,21 @@ func runNodeAgent(ctx context.Context, args []string) error {
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Kubelet + placement, if a CRI endpoint is reachable. Optional so the agent
-	// can serve the API-only on a host without containerd (e.g. for testing).
+	// Litterbox (neko's minimal kubelet) + placement, if a CRI endpoint is
+	// reachable. Optional so the agent can serve API-only on a host without
+	// containerd (e.g. for testing).
 	if *criEndpoint != "" {
 		rt, err := cri.New(*criEndpoint)
 		if err == nil {
 			if _, verr := rt.Version(ctx); verr == nil {
-				kl := kubelet.New(*nodeName, acc, rt)
+				lb := litterbox.New(*nodeName, acc, rt)
 				go func() {
-					if rerr := kl.Run(ctx); rerr != nil && ctx.Err() == nil {
-						log.Printf("kubelet stopped: %v", rerr)
+					if rerr := lb.Run(ctx); rerr != nil && ctx.Err() == nil {
+						log.Printf("litterbox stopped: %v", rerr)
 					}
 				}()
 				go runBinder(ctx, acc, *nodeName) // trivial placement (D5)
-				log.Printf("kubelet running (node=%s, cri=%s)", *nodeName, *criEndpoint)
+				log.Printf("litterbox running (node=%s, cri=%s)", *nodeName, *criEndpoint)
 			} else {
 				log.Printf("CRI unreachable (%v); serving API only", verr)
 			}
@@ -126,6 +130,18 @@ func runNodeAgent(ctx context.Context, args []string) error {
 			log.Printf("CRI dial failed (%v); serving API only", err)
 		}
 	}
+
+	// Controllers: Deployment -> ReplicaSet -> Pod. Always run (pure store work,
+	// no CRI needed) so `neko apply` of a Deployment converges to Pods.
+	go func() {
+		err := controller.Run(ctx, acc,
+			&deployment.Reconciler{Client: acc},
+			&replicaset.Reconciler{Client: acc},
+		)
+		if err != nil && ctx.Err() == nil {
+			log.Printf("controllers stopped: %v", err)
+		}
+	}()
 
 	srv := &http.Server{Addr: *addr, Handler: httpapi.New(st, nil).Routes()}
 	go func() {
@@ -144,7 +160,7 @@ func runNodeAgent(ctx context.Context, args []string) error {
 
 // runBinder is neko-box's trivial placement (the kube-scheduler replacement, D5):
 // single node, so bind every unbound Pod to this node. Watches Pods and sets
-// Spec.NodeName where empty, which is what makes the kubelet act on them.
+// Spec.NodeName where empty, which is what makes the litterbox act on them.
 func runBinder(ctx context.Context, acc *access.InProc, nodeName string) {
 	ch, err := acc.Watch(ctx, "Pod", "", 0)
 	if err != nil {

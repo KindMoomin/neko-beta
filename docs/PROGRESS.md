@@ -1,6 +1,25 @@
 # neko-box — Progress
 
-_Last updated: 2026-10-30_
+_Last updated: 2026-10-31_
+
+## Known issues (open)
+
+- **Litterbox drops a live pod event: only 1 of N deployment pods starts on the
+  initial apply.** With a Deployment `replicas>=2`, the controllers correctly
+  create and bind all pods (verified: both `web-rs-0`/`web-rs-1` get
+  `nodeName=node0` in the store), but the litterbox starts only ONE sandbox on
+  the first watch. **All pods DO start after a `node-agent` restart** (the fresh
+  watch replay reconciles them), which points at a missed/dropped *live* watch
+  event, not reconcile logic. Tried (did NOT fix): moving `ensureRunning` into a
+  per-pod goroutine with a per-UID busy guard (`internal/litterbox`). Ruled out:
+  binder conflict (both pods end up bound); litterbox error (agent log is clean —
+  `ensureRunning` is never called for the 2nd pod). **Next step:** a debug
+  `log.Printf` is currently left in `internal/litterbox/litterbox.go` `handle()`
+  — run `neko up` + apply `examples/deployment.toml`, read which `event
+  type/pod/phase` lines actually arrive, and compare against the store's watch
+  publish path (`internal/store/store.go` `publish`/`Watch`). Suspect the store
+  `Watch` replay+tail hand-off or slow-consumer drop. **Remove that debug line**
+  once resolved.
 
 ## Phase: Design
 
