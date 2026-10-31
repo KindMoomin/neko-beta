@@ -1,0 +1,18 @@
+# Go build output
+/neko
+/bin/
+*.exe
+*.test
+*.out
+
+# Go module/build cache artifacts (none vendored yet)
+/vendor/
+
+# eBPF build artifacts (bpf/ compiles to .o at the dataplane milestone)
+*.o
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
