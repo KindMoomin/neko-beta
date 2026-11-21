@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -87,7 +88,10 @@ func (c *Client) Apply(ctx context.Context, tomlPath string) error {
 }
 
 // Get fetches and renders objects of a kind (ns=="" lists all namespaces).
+// Get lists objects of a kind and renders them. The kind is canonicalized so
+// `pod`, `pods`, and `po` all resolve to `Pod` (the single on-wire spelling).
 func (c *Client) Get(ctx context.Context, kind, ns string) error {
+	kind = canonicalKind(kind)
 	u := c.base + "/v1/" + kind
 	if ns != "" {
 		u += "?namespace=" + url.QueryEscape(ns)
@@ -113,6 +117,7 @@ func (c *Client) Get(ctx context.Context, kind, ns string) error {
 
 // Delete removes an object (read-then-delete to supply the current revision).
 func (c *Client) Delete(ctx context.Context, kind, ns, name string) error {
+	kind = canonicalKind(kind)
 	if ns == "" {
 		ns = "default"
 	}
@@ -144,6 +149,29 @@ func (c *Client) Logs(ctx context.Context, ns, pod string) error {
 
 // --- internals -------------------------------------------------------------
 
+// kindAliases maps lowercase user input (singular, plural, and common short
+// forms) to the one canonical kind spelling the API and store use. neko-box
+// has a closed, compiled-in set of kinds (no CRD discovery), so this is a tiny
+// static table rather than k8s's RESTMapper/discovery machinery.
+var kindAliases = map[string]string{
+	"pod": "Pod", "pods": "Pod", "po": "Pod",
+	"namespace": "Namespace", "namespaces": "Namespace", "ns": "Namespace",
+	"deployment": "Deployment", "deployments": "Deployment", "deploy": "Deployment",
+	"replicaset": "ReplicaSet", "replicasets": "ReplicaSet", "rs": "ReplicaSet",
+	"service": "Service", "services": "Service", "svc": "Service",
+	"endpointslice": "EndpointSlice", "endpointslices": "EndpointSlice", "eps": "EndpointSlice",
+}
+
+// canonicalKind resolves user-typed kind input to the canonical spelling. An
+// exact canonical kind passes through unchanged; an unknown input is returned
+// as-is so the server produces the authoritative "unknown kind" error.
+func canonicalKind(kind string) string {
+	if c, ok := kindAliases[strings.ToLower(kind)]; ok {
+		return c
+	}
+	return kind
+}
+
 // getObject GETs one object and decodes it into its concrete api type.
 func (c *Client) getObject(ctx context.Context, kind, ns, name string) (api.Object, bool, error) {
 	u := fmt.Sprintf("%s/v1/%s/%s/%s", c.base, kind, ns, name)
@@ -173,22 +201,66 @@ func (c *Client) getObject(ctx context.Context, kind, ns, name string) (api.Obje
 	return obj, true, nil
 }
 
-// renderList prints a simple NAME/NAMESPACE/REVISION table.
+// renderList prints a table whose columns depend on the kind: Pods show
+// phase/IP/ready, Services show the cluster IP, everything else falls back to a
+// generic name/revision table.
 func (c *Client) renderList(kind string, items []json.RawMessage) error {
 	tw := tabwriter.NewWriter(c.out, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(tw, "NAMESPACE\tNAME\tREVISION")
-	for _, raw := range items {
+	defer tw.Flush()
+
+	decode := func(raw json.RawMessage) (api.Object, error) {
 		obj, err := api.New(kind)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if err := json.Unmarshal(raw, obj); err != nil {
-			return err
+			return nil, err
 		}
-		m := obj.GetMeta()
-		fmt.Fprintf(tw, "%s\t%s\t%d\n", m.Namespace, m.Name, m.Revision)
+		return obj, nil
 	}
-	return tw.Flush()
+
+	switch kind {
+	case "Pod":
+		fmt.Fprintln(tw, "NAMESPACE\tNAME\tPHASE\tIP\tREADY")
+		for _, raw := range items {
+			obj, err := decode(raw)
+			if err != nil {
+				return err
+			}
+			p := obj.(*api.Pod)
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%t\n",
+				p.Meta.Namespace, p.Meta.Name, dash(p.Status.Phase), dash(p.Status.PodIP), p.Status.Ready)
+		}
+	case "Service":
+		fmt.Fprintln(tw, "NAMESPACE\tNAME\tCLUSTERIP")
+		for _, raw := range items {
+			obj, err := decode(raw)
+			if err != nil {
+				return err
+			}
+			s := obj.(*api.Service)
+			fmt.Fprintf(tw, "%s\t%s\t%s\n", s.Meta.Namespace, s.Meta.Name, dash(s.Spec.ClusterIP))
+		}
+	default:
+		fmt.Fprintln(tw, "NAMESPACE\tNAME\tREVISION")
+		for _, raw := range items {
+			obj, err := decode(raw)
+			if err != nil {
+				return err
+			}
+			m := obj.GetMeta()
+			fmt.Fprintf(tw, "%s\t%s\t%d\n", m.Namespace, m.Name, m.Revision)
+		}
+	}
+	return nil
+}
+
+// dash renders an empty field as "-" so columns stay readable.
+func dash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 func httpError(resp *http.Response) error {
