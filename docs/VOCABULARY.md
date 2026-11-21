@@ -127,7 +127,59 @@ machinery at first (the controllers already exist) — the vocabulary is the
 user-facing surface; the lowering is an implementation detail we can keep or
 flatten later.
 
-## Near-term (DONE — independent of this sketch)
+## Security: abstracted, guardrailed by default (PROPOSED, DEFERRED)
+
+Kubernetes exposes the full Linux security surface directly — `securityContext`
+with `privileged`, `allowPrivilegeEscalation`, `capabilities.add`, `runAsUser:
+0`, `hostPID/hostNetwork/hostPATH`, and a separate opt-in PodSecurity admission
+layer you have to *remember* to turn on. The default is permissive; safety is a
+thing you bolt on. That's backwards for a developer box.
+
+neko-box should invert it: **sandboxed and non-escalating by default, with a
+small set of named, auditable capability levels instead of raw knobs.** Because
+the kind set is closed, we can make the safe thing the default thing.
+
+Proposed shape (react to when we build it):
+- **A `sandbox` level on Workload/Task**, not a raw `securityContext`. A short
+  enum of intent, each mapping to a vetted set of OCI/seccomp/capability
+  settings neko-box controls:
+  - `strict` (default) — non-root, `no-new-privileges`, drop ALL capabilities,
+    read-only rootfs where possible, default seccomp profile, no host namespaces.
+    What you get unless you say otherwise.
+  - `standard` — non-root, a small allowlist of common capabilities
+    (e.g. `NET_BIND_SERVICE`), writable rootfs. For ordinary apps that need a
+    privileged port or a scratch dir.
+  - `trusted` — escape hatch for the rare case (needs explicit opt-in + a loud
+    log line). Still never silently `privileged`; privileged is its own separate,
+    even-louder flag so it can't be reached by accident.
+- **Privilege escalation off, always, unless `trusted`+explicit.** The common
+  k8s footgun (`allowPrivilegeEscalation` defaulting on) simply isn't reachable.
+- **No host namespaces / host mounts by default.** `hostPID`, `hostNetwork`, and
+  host path mounts require the `trusted` level — the sandbox is the default
+  boundary, not an afterthought.
+- **Guardrails are enforced at the CRI boundary**, in one place
+  (`internal/cri` builds the `LinuxContainerSecurityContext`), so the policy is
+  centralized and testable — not scattered across per-object specs. A single
+  `sandbox.go` translates the level enum → the concrete OCI settings.
+- **Auditable:** the node-agent logs the effective sandbox level per Workload,
+  and `neko get` can surface it, so "what can this actually do" is answerable
+  without decoding a securityContext.
+
+Open forks to resolve when we build it:
+1. **Where seccomp/AppArmor profiles live** — baked into the node image (D11
+   image work already preps the node), or shipped per-level by neko-box.
+2. **How `trusted` is gated** — a per-node allow flag at `neko up`, a field that
+   must be set in two places, or a confirm prompt. It must be hard to reach by
+   accident.
+3. **Interaction with `neko import`** — a k8s Pod with `privileged: true` maps to
+   what? Probably refuse-by-default and require the user to re-declare intent as
+   `trusted`, rather than silently honoring an imported privileged container.
+4. **Rootless vs. the privileged node.** The node container itself runs
+   privileged (nested containerd needs it, D11). The guardrails are about the
+   *workloads inside* the node, not the node boundary — document that distinction
+   so nobody assumes the node is sandboxed.
+
+
 
 The `neko get` CLI already canonicalizes kind input client-side
 (`internal/clientcmd` `canonicalKind` + `kindAliases`): `pod`/`pods`/`po` → the

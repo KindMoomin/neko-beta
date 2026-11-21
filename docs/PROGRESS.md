@@ -1,25 +1,28 @@
 # neko-box — Progress
 
-_Last updated: 2026-10-31_
+_Last updated: 2026-11-20_
 
 ## Known issues (open)
 
-- **Litterbox drops a live pod event: only 1 of N deployment pods starts on the
-  initial apply.** With a Deployment `replicas>=2`, the controllers correctly
-  create and bind all pods (verified: both `web-rs-0`/`web-rs-1` get
-  `nodeName=node0` in the store), but the litterbox starts only ONE sandbox on
-  the first watch. **All pods DO start after a `node-agent` restart** (the fresh
-  watch replay reconciles them), which points at a missed/dropped *live* watch
-  event, not reconcile logic. Tried (did NOT fix): moving `ensureRunning` into a
-  per-pod goroutine with a per-UID busy guard (`internal/litterbox`). Ruled out:
-  binder conflict (both pods end up bound); litterbox error (agent log is clean —
-  `ensureRunning` is never called for the 2nd pod). **Next step:** a debug
-  `log.Printf` is currently left in `internal/litterbox/litterbox.go` `handle()`
-  — run `neko up` + apply `examples/deployment.toml`, read which `event
-  type/pod/phase` lines actually arrive, and compare against the store's watch
-  publish path (`internal/store/store.go` `publish`/`Watch`). Suspect the store
-  `Watch` replay+tail hand-off or slow-consumer drop. **Remove that debug line**
-  once resolved.
+_None._
+
+## Resolved issues
+
+- **Litterbox started only 1 of N deployment pods on initial apply — FIXED
+  2026-11-20.** Root cause (diagnosed with a red-capable test, not the store
+  path the old note suspected): the litterbox keyed its per-pod `busy` and
+  `sandboxes` maps by `pod.Meta.UID`, but the replicaset controller creates pods
+  with **no UID** (`internal/controller/replicaset.createPod` never sets it). So
+  every replica collided on the empty-string key `""` — pod #2's reconcile saw
+  `busy[""]`/`sandboxes[""]` already set and returned early, starting only one
+  sandbox. (The earlier "per-UID busy guard" wasn't a failed fix — it *was* the
+  bug.) **Fix:** key by namespace/name (the store identity, always unique) via
+  `internal/litterbox.podKey`. Regression test `litterbox_test.go`
+  `TestPodKeyDistinctForReplicas` goes red on UID keying, green on the fix.
+  Verified end to end: `neko apply examples/deployment.toml` (`replicas=2`) →
+  **both** `web-rs-0` (10.244.0.3) and `web-rs-1` (10.244.0.2) reach Running on
+  the first apply, two real nginx containers in the node. Debug line removed.
+
 
 ## Phase: Design
 

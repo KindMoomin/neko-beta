@@ -28,9 +28,15 @@ type Litterbox struct {
 	runtime  *cri.Runtime
 
 	mu        sync.Mutex
-	sandboxes map[string]*cri.Sandbox // pod UID -> running sandbox
-	busy      map[string]bool         // pod UID -> reconcile in flight
+	sandboxes map[string]*cri.Sandbox // podKey -> running sandbox
+	busy      map[string]bool         // podKey -> reconcile in flight
 }
+
+// podKey is a pod's identity for the litterbox's per-pod maps. It uses
+// namespace/name — the store key, always unique — NOT pod.Meta.UID, which is
+// not assigned for controller-created pods (empty UIDs would collide, starting
+// only one of N replicas). See store/watchdrop_test.go.
+func podKey(p *api.Pod) string { return p.Meta.Namespace + "/" + p.Meta.Name }
 
 // New constructs a litterbox for one node.
 func New(nodeName string, client access.StoreAccess, rt *cri.Runtime) *Litterbox {
@@ -69,14 +75,14 @@ func (k *Litterbox) Run(ctx context.Context) error {
 
 // handle reconciles one watch event for a Pod. It dispatches the actual work to
 // a per-pod goroutine so that a slow pod (image pull, sandbox create) never
-// blocks the watch loop and stalls other pods (head-of-line blocking). A per-UID
-// "busy" guard ensures only one reconcile runs per pod at a time.
+// blocks the watch loop and stalls other pods (head-of-line blocking). A
+// per-pod "busy" guard (keyed by namespace/name) ensures only one reconcile
+// runs per pod at a time.
 func (k *Litterbox) handle(ctx context.Context, ev store.Event) {
 	pod, ok := ev.Object.(*api.Pod)
 	if !ok {
 		return
 	}
-	log.Printf("litterbox DEBUG: event type=%d pod=%s node=%q phase=%q", ev.Type, pod.Meta.Name, pod.Spec.NodeName, pod.Status.Phase)
 	// Only act on pods bound to this node.
 	if pod.Spec.NodeName != k.nodeName {
 		return
@@ -86,18 +92,19 @@ func (k *Litterbox) handle(ctx context.Context, ev store.Event) {
 		return
 	}
 	// Coalesce concurrent reconciles for the same pod.
+	key := podKey(pod)
 	k.mu.Lock()
-	if k.busy[pod.Meta.UID] {
+	if k.busy[key] {
 		k.mu.Unlock()
 		return
 	}
-	k.busy[pod.Meta.UID] = true
+	k.busy[key] = true
 	k.mu.Unlock()
 
 	go func() {
 		defer func() {
 			k.mu.Lock()
-			delete(k.busy, pod.Meta.UID)
+			delete(k.busy, key)
 			k.mu.Unlock()
 		}()
 		if err := k.ensureRunning(ctx, pod); err != nil {
@@ -108,8 +115,9 @@ func (k *Litterbox) handle(ctx context.Context, ev store.Event) {
 
 // ensureRunning brings a bound Pod up to Running if it isn't already.
 func (k *Litterbox) ensureRunning(ctx context.Context, pod *api.Pod) error {
+	key := podKey(pod)
 	k.mu.Lock()
-	_, already := k.sandboxes[pod.Meta.UID]
+	_, already := k.sandboxes[key]
 	k.mu.Unlock()
 	if already || pod.Status.Phase == "Running" {
 		return nil
@@ -121,7 +129,7 @@ func (k *Litterbox) ensureRunning(ctx context.Context, pod *api.Pod) error {
 		return err
 	}
 	k.mu.Lock()
-	k.sandboxes[pod.Meta.UID] = sb
+	k.sandboxes[key] = sb
 	k.mu.Unlock()
 
 	// Pull + start each container.
@@ -141,9 +149,10 @@ func (k *Litterbox) ensureRunning(ctx context.Context, pod *api.Pod) error {
 
 // teardown stops the sandbox for a deleted Pod.
 func (k *Litterbox) teardown(ctx context.Context, pod *api.Pod) {
+	key := podKey(pod)
 	k.mu.Lock()
-	sb := k.sandboxes[pod.Meta.UID]
-	delete(k.sandboxes, pod.Meta.UID)
+	sb := k.sandboxes[key]
+	delete(k.sandboxes, key)
 	k.mu.Unlock()
 	if sb == nil {
 		return
