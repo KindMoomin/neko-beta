@@ -109,6 +109,11 @@ Open forks to resolve when we build it:
 1. **Node-cgroup attach + store attribution** (chosen for now) vs. true
    per-workload cgroup attach — the latter is only needed for per-workload
    *policy*, not per-workload *data*. Lean node-cgroup until a policy need appears.
+   **Note (2026-11-21):** the node-root attach does NOT currently surface pod-IP
+   RTT — pod sockets live in per-pod netns and the root-netns kprobe never emits
+   a pod-IP destination. So per-pod attribution likely forces per-netns/per-pod
+   attach sooner than this fork assumed. See the open "RTT not attributed to
+   pods" issue in `docs/PROGRESS.md` (try dropping `ipMasq` first).
 2. **Measurement scope** — all connections node-wide (egress included, matches
    the cheap attach) vs. only Network-backend traffic. Lean node-wide for the
    data; `Network` policy decides what to expose/act on.
