@@ -52,6 +52,43 @@ Open forks to resolve when we build it:
    explicitly (it would anyway) and a controller watches those refs. That's a
    real controller, not a freebie.
 
+#### Implementation approach (decisions for the first cut)
+
+The current controllers show the lowering pattern a Workload plugs into:
+`Deployment`→`ReplicaSet` (`internal/controller/deployment`) is a clean
+level-triggered reconcile that writes one child object, and `ReplicaSet`→`Pod`
+(`internal/controller/replicaset`) + the binder + litterbox already run pods
+end to end (multi-replica verified). A Workload controller is the same shape:
+lower `Workload`→`ReplicaSet`, reuse the whole working RS→Pod path. Kinds
+register via `Kinds()`/`MapToReconcileKey()`/`Reconcile()` and `api.New`.
+
+**Fork A — how much the FIRST cut does:**
+1. **Lowering only (recommended): `Workload`→`ReplicaSet`.** Workload is the
+   single declared kind; `replicas>=1` always (no bare-Pod authoring). This is
+   the "collapse the trinity" core — shippable now, reusing everything that
+   works. Auto-behaviors deferred.
+2. **Lowering + auto-observability.** Wire RTT latency "on" per Workload — BUT
+   per-pod RTT attribution is the **known-broken netns gap** (see PROGRESS.md
+   open issue), so "auto observability" would be on-paper only until that's
+   fixed. Couples this feature to an open bug — avoid for the first cut.
+3. **Lowering + config-reload.** Needs NEW `ConfigMap`/`Secret` kinds (don't
+   exist yet), a watch-and-rolling-restart controller, and a reload-semantics
+   decision (fork 1 above). Much larger — several new subsystems. Defer.
+
+**Fork B — coexist vs replace:**
+1. **Add `Workload` alongside (recommended).** Keep `Deployment`/`ReplicaSet`/
+   `Pod` as-is; add `Workload` as a new higher-level kind that lowers to
+   `ReplicaSet`. Non-breaking, incremental, both coexist; `neko import` can
+   target `Workload` later.
+2. **Replace `Deployment` outright.** Remove the `Deployment` kind + controller;
+   `Workload` takes its place. Cleaner end state matching this vocabulary, but
+   breaks `examples/deployment.toml` and the just-validated Deployment path.
+
+Leaning **A1 + B1**: lower-only, alongside the existing kinds — the smallest
+shippable step that realizes the vocabulary without coupling to the open RTT gap
+or inventing ConfigMap/Secret kinds. Auto-behaviors and the Deployment
+retirement follow once their prerequisites land.
+
 ### `Network` — the addressable front (replaces Service)
 
 "Network" is the noun for *how a Workload is reached* — named, DNS-resolvable,
