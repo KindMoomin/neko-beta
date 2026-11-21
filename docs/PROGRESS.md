@@ -1,10 +1,47 @@
 # neko-box — Progress
 
-_Last updated: 2026-11-20_
+_Last updated: 2026-11-21_
 
 ## Known issues (open)
 
-_None._
+- **RTT latency is measured but not yet attributed to pods (per-pod/service
+  latency shows empty).** The eBPF RTT dataplane works end to end — the C kprobe
+  on `tcp_rcv_established` (`bpf/rtt/rtt.bpf.c`) loads, attaches, and emits real
+  samples; the Go loader (`internal/nekonet`) drained **6748 samples** in a live
+  run; the histogram rollup, `/v1/latency/service/...` route, and `neko latency`
+  CLI all function. **But `neko latency service/web` returns "no samples"**
+  because every emitted sample carries a *node-root-netns* destination
+  (`127.0.0.1` = etcd/kube-apiserver, `172.19.x` = the Docker network) — **never
+  a pod IP (`10.244.0.x`)**, so the DstIP→Service join (`internal/observ`
+  `ForService`) finds nothing for the pods. Verified across node→pod curls,
+  sustained 20 MB downloads, and pod→pod traffic: no `0af4000x` daddr ever
+  emitted.
+  - **Root cause:** `tcp_rcv_established` fires in the context of the socket's
+    **network namespace**, and pod sockets live in per-pod netns. A single kprobe
+    attached from the root netns doesn't surface pod-netns connections' pod-IP
+    tuples. The CNI conflist's `ipMasq=true` (masquerades pod source IPs) likely
+    compounds it.
+  - **This is a deferred-milestone limitation, NOT a code bug.** The loader,
+    decode, rollup, API, and CLI are all correct (the sock_ops→kprobe switch was
+    exactly to fix the earlier empty-ringbuf problem, and it did — samples now
+    flow). The plan always deferred per-pod attach: "node-cgroup attach + store
+    attribution for now; true per-workload cgroup attach is a later option."
+  - **Two unexplored paths to revisit (in order of effort):**
+    1. **Drop `ipMasq` and re-test (~10 min, do this FIRST).** Flip `ipMasq` to
+       `false` in `internal/cni.Conflist` (`internal/cni/cni.go:15`) and re-run
+       the latency smoke. If pod IPs then appear as `daddr`, masquerade was
+       hiding them and the fix is config, not eBPF. Cheap check before path 2.
+    2. **Per-netns / per-pod attach (real eBPF work, uncertain depth).** Attach
+       the probe inside each pod's netns (or make it netns-aware) so it sees
+       pod-namespace connections. Means hooking pod creation and managing a probe
+       per pod — the "per-workload cgroup attach" the plan deferred. Only pursue
+       if path 1 doesn't resolve it.
+  - **To resume:** `make node-image` → `neko up` → `neko apply
+    examples/deployment.toml` + a Service with selector `app=web` → generate
+    pod traffic → `neko latency service/web`. Success = non-zero p50/p95. A
+    `bpf_printk` in `rtt.bpf.c` on `e->daddr` + `cat
+    /sys/kernel/debug/tracing/trace_pipe | grep 0af4000` shows whether pod IPs
+    are emitted at all (the key diagnostic).
 
 ## Resolved issues
 
