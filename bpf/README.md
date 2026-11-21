@@ -21,15 +21,22 @@ Verified loadable on this machine: `cgroup_sock_addr` program type is available
 (see `docs/PLATFORM.md`).
 
 ### `rtt/` — per-connection TCP RTT observer
-The **vendored** `sock_ops` program from the sibling `neko-net` project, built
-to a `.o`. neko-box is the **sole loader and ring-buffer consumer** — neko-net's
-own userspace daemon does NOT run in the node container (interrogation B2).
+A **neko-box-owned C kprobe** (`rtt/rtt.bpf.c`) on the kernel's
+`tcp_rcv_established`. It reads the smoothed RTT (`tcp_sock.srtt_us >> 3`) and the
+connection 4-tuple off each socket via CO-RE and emits an `rtt_event` (see
+`rtt/rtt.h`) to the `RTT_EVENTS` ring buffer, which `internal/nekonet` drains.
 
-## Language & build (to be decided at implementation)
+> History: this was originally the vendored `sock_ops` RTT program from the
+> sibling `neko-net` project, but that program's `BPF_SOCK_OPS_RTT_CB` callback
+> never fires on the node kernel (linuxkit) — verified: program loads, attaches,
+> and runs, but the ring buffer stays empty. A kprobe on `tcp_rcv_established`
+> (the mechanism bcc `tcprtt` / Cilium use) fires reliably. neko-net remains a
+> reference; it is no longer built or loaded.
 
-Either C (clang/libbpf, CO-RE against the VM kernel's BTF) or Rust (aya, as
-neko-net already uses). The RTT program is reused from neko-net, so matching its
-Rust/aya toolchain for both is the lower-friction path. The build emits objects
-that `internal/nekonet` loads via `cilium/ebpf`.
+## Language & build
 
-Build wiring is intentionally not implemented in this skeleton.
+C (clang, CO-RE against a committed `include/vmlinux.h`, relocated to the node
+kernel's BTF at load). The node image builds the object (see
+`images/node/Dockerfile`, the `bpf` stage) to `/opt/neko/bpf/rtt.o`;
+`internal/nekonet` loads it via `cilium/ebpf`. `svc_lb` (Phase 2) will share this
+same C/clang toolchain and `vmlinux.h`.

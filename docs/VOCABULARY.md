@@ -60,6 +60,62 @@ and backed by the eBPF connect-hook LB (D6). Open fork: is load-balancing
 observability is always implied for Workload? Leaning yes — that's the point of
 batteries-included — but confirm when building.
 
+#### Pluggable dataplane on `Network` (neko-net's home, observer → actor)
+
+`Network` is where the eBPF dataplane is exposed as policy, because it already
+owns load-balancing. The key insight: **neko-net's RTT observer and the future
+latency-aware balancer are the same dataplane.** neko-net today *watches* every
+connection and emits latency; its own roadmap (M2) is to *route* on those
+measurements. So the plug should be designed as "this Network participates in
+the smart dataplane," not "metrics on/off" — then routing lights up as a
+capability later without a redesign.
+
+Proposed surface (sketch — build `observe` first, keep `balance` forward-compat):
+```toml
+[spec.dataplane]
+observe = "latency"        # neko-net RTT attributed to this Network's backends
+balance = "round-robin"    # today; "latency-aware" is the M2 future — route to
+                           # the lowest-RTT healthy backend, fed by the observe stream
+```
+
+The layering that makes this work (and keeps neko-net a living upstream, not a
+one-time copy):
+- **neko-net RTT program = node-cgroup observer.** One cheap attach at the node
+  container's root cgroup sees all connections (as neko-net's README describes).
+  Not per-workload cgroup attach — that stays a later option (see fork 1).
+- **`internal/observ` = attribution.** Slice the one node-wide stream into
+  per-Workload / per-Network latency by joining the remote IP against the store
+  (EndpointSlices/Pods). So data is per-workload even though the program is
+  node-wide — sidestepping per-cgroup attach cost while feeling granular.
+- **`Network.spec.dataplane` = policy.** `observe` exposes the latency;
+  `balance = "latency-aware"` is where neko-net graduates observer → actor: the
+  connect-hook `svc_lb` program reads the live RTT and picks the fastest healthy
+  backend instead of round-robin. **This is the networking feature that makes
+  neko-net structurally necessary** rather than a readout — and a differentiated
+  local-dev feature (watch the mesh route around a slow pod, live).
+
+How neko-net stays in the picture (vs. the C re-implementation alternative):
+neko-net remains a **living upstream dependency**, not a vendored copy. neko-box
+builds neko-net's compiled `.o` (its `sock_ops` RTT program) and loads it via
+its own Go loader (`internal/nekonet`); neko-net's userspace daemon never runs
+(D2). The shared contract is `neko-net-common`'s `RttEvent` struct. When neko-net
+ships its M1.5 richer payload (src addr/port + timestamp) or M2 routing logic,
+neko-box inherits it by rebuilding the object — no neko-box program rewrite.
+Cost accepted: a Rust (nightly + bpf-linker + aya) toolchain for the RTT program
+*and* a C/clang toolchain for the neko-box-only `svc_lb` program — two BPF
+toolchains, because `svc_lb` has no neko-net equivalent.
+
+Open forks to resolve when we build it:
+1. **Node-cgroup attach + store attribution** (chosen for now) vs. true
+   per-workload cgroup attach — the latter is only needed for per-workload
+   *policy*, not per-workload *data*. Lean node-cgroup until a policy need appears.
+2. **Measurement scope** — all connections node-wide (egress included, matches
+   the cheap attach) vs. only Network-backend traffic. Lean node-wide for the
+   data; `Network` policy decides what to expose/act on.
+3. **`balance = "latency-aware"`** — documented M2/M3 goal; build only `observe`
+   first, but land the `Network.spec.dataplane` surface now so it's
+   forward-compatible.
+
 ### `Task` — the escape hatch below Workload (one-shot runs)
 
 `Task` is the one-shot, below-Workload primitive: run an arbitrary container

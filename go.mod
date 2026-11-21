@@ -4,6 +4,7 @@ go 1.26.2
 
 require (
 	github.com/BurntSushi/toml v1.6.0
+	github.com/cilium/ebpf v0.22.0
 	google.golang.org/grpc v1.85.0
 	k8s.io/cri-api v0.31.2
 )
