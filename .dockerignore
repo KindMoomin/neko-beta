@@ -1,0 +1,25 @@
+# Keep the node-image build context lean. The Go builder stage only needs the
+# module sources; everything below is irrelevant to the build.
+.git
+.gitignore
+.dockerignore
+/neko
+/bin/
+*.test
+*.out
+*.o
+.DS_Store
+*.swp
+.idea/
+.vscode/
+docs/
+examples/
+hack/
+bpf/
+README.md
+
+# images/ is excluded from the Go builder context, but the final stage COPYs
+# two files from images/node/ — allow just those back in.
+images/
+!images/node/10-neko.conflist
+!images/node/neko-bpf-prep.service

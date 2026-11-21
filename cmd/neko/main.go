@@ -190,15 +190,15 @@ func runBinder(ctx context.Context, acc *access.InProc, nodeName string) {
 	}
 }
 
-// runUp boots the privileged node container (kindest/node) with kind's docker
-// flags so its entrypoint does the nested-container setup, installs CNI, and
-// launches `neko node-agent` inside it.
+// runUp boots the privileged node container via `docker run` (with the ext4
+// `/var` volume that makes containerd's snapshotter work nested — see D11),
+// installs CNI, and launches `neko node-agent` inside it.
 func runUp(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("up", flag.ContinueOnError)
-	name := fs.String("name", "", "node cluster name")
-	image := fs.String("image", "", "kindest/node image")
+	name := fs.String("name", "", "node name")
+	image := fs.String("image", "", "node image (default: the neko-owned image; build with `make node-image`)")
 	port := fs.Int("port", 7443, "host port to publish the node-agent API on")
-	nekoBin := fs.String("neko-bin", "", "path to a linux/arm64 neko binary to run in the node")
+	nekoBin := fs.String("neko-bin", "", "optional linux/arm64 neko binary to overlay over the image's baked one")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -210,7 +210,7 @@ func runUp(ctx context.Context, args []string) error {
 	})
 }
 
-// runDown stops and removes the node container.
+// runDown removes the node container and its /var volume.
 func runDown(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("down", flag.ContinueOnError)
 	name := fs.String("name", "", "node container name")

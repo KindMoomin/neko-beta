@@ -1,0 +1,1 @@
+{"cniVersion":"1.0.0","name":"neko","plugins":[{"type":"ptp","ipMasq":true,"ipam":{"type":"host-local","ranges":[[{"subnet":"10.244.0.0/16"}]],"routes":[{"dst":"0.0.0.0/0"}]}},{"type":"loopback"}]}

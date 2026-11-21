@@ -53,11 +53,15 @@ program first loads, not a platform risk.
 > concrete nested-container requirements surfaced — each is a **node bring-up**
 > concern (what `neko up` must do), not a `cri` code concern:
 >
-> 1. **Snapshotter must be `fuse-overlayfs`** (or `native`) when nested —
->    overlayfs-on-overlayfs fails ("failed to mount rootfs component"). kind's
->    node entrypoint auto-selects this; `neko up` must too, e.g. set
->    `KIND_EXPERIMENTAL_CONTAINERD_SNAPSHOTTER=fuse-overlayfs` or run the node's
->    own entrypoint rather than a bare `docker run`.
+> 1. **`/var/lib/containerd` must be on a real block FS, not overlayfs.** The
+>    "failed to mount rootfs component: invalid argument" (EINVAL) failure is
+>    **overlay-on-overlay**: on a bare `docker run`, `/var/lib/containerd` lands
+>    on the container's own overlayfs rootfs, and the kernel rejects an overlay
+>    snapshot whose upper/work dirs sit on another overlayfs. **Fix (proven
+>    2026-11-20, see D11): mount an ext4-backed Docker volume at `/var`** — then
+>    the *default* overlayfs snapshotter works. (Earlier note here prescribed
+>    `fuse-overlayfs`; that was a wrong diagnosis — the snapshotter type was
+>    never the cause, the `/var` backing FS was. `neko up` mounts the volume.)
 > 2. **Cgroup parent must be systemd-slice form** (`*.slice`) because the node
 >    runs containerd with `SystemdCgroup=true` — a plain cgroupfs path makes runc
 >    reject the task. **Fixed in `cri.CreateSandbox`** (sets `Linux.CgroupParent`).
@@ -66,11 +70,11 @@ program first loads, not a platform risk.
 >    `host-local`, `loopback`, `portmap` (NOT `bridge`); the `neko` CNI installs
 >    its own conflist. Pod CIDR `10.244.0.0/16`.
 >
-> **Key lesson:** `neko up` cannot be a bare `docker run kindest/node` — that
-> skips kind's entrypoint node-setup (snapshotter select, mounts, a stable pause
-> process). `neko up` must either drive the kindest/node entrypoint the way kind
-> does, or build our own node image. A residual pause-process instability under
-> bare-run confirmed this is a bring-up problem, not a CRI-client problem.
+> **Key lesson:** a bare `docker run kindest/node` fails the sandbox rootfs mount
+> **only because `/var/lib/containerd` is on overlayfs** — not because of
+> entrypoint magic. Mounting an ext4 Docker volume at `/var` closes the gap, so
+> `neko up` is a plain `docker run` (+ `/var` volume + CNI install), no kind
+> library needed (D11, resolved 2026-11-20).
 
 - **Node base image:** start from `kindest/node` (it already bundles containerd
   + runc + the nested-container mounts kind spent years getting right) OR a
