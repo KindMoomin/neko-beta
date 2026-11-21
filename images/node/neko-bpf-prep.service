@@ -1,0 +1,19 @@
+# eBPF runtime prep for the neko-box node: mount bpffs and create the pin dir
+# at boot. Idempotent — a privileged node may already have bpffs mounted.
+# Does NOT load any BPF program (deferred to the eBPF phase); it only prepares
+# the runtime. The BTF check is passive (log only) — hard preflight is M3.
+[Unit]
+Description=neko-box eBPF runtime prep (bpffs + pin dir)
+DefaultDependencies=no
+After=sysinit.target
+Before=containerd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'mountpoint -q /sys/fs/bpf || mount -t bpf bpffs /sys/fs/bpf'
+ExecStart=/bin/mkdir -p /sys/fs/bpf/neko
+ExecStart=/bin/sh -c 'test -f /sys/kernel/btf/vmlinux || echo "neko-bpf-prep: WARNING /sys/kernel/btf/vmlinux absent (BTF missing)"'
+
+[Install]
+WantedBy=multi-user.target

@@ -1,25 +1,28 @@
 # neko-box — Progress
 
-_Last updated: 2026-10-31_
+_Last updated: 2026-11-20_
 
 ## Known issues (open)
 
-- **Litterbox drops a live pod event: only 1 of N deployment pods starts on the
-  initial apply.** With a Deployment `replicas>=2`, the controllers correctly
-  create and bind all pods (verified: both `web-rs-0`/`web-rs-1` get
-  `nodeName=node0` in the store), but the litterbox starts only ONE sandbox on
-  the first watch. **All pods DO start after a `node-agent` restart** (the fresh
-  watch replay reconciles them), which points at a missed/dropped *live* watch
-  event, not reconcile logic. Tried (did NOT fix): moving `ensureRunning` into a
-  per-pod goroutine with a per-UID busy guard (`internal/litterbox`). Ruled out:
-  binder conflict (both pods end up bound); litterbox error (agent log is clean —
-  `ensureRunning` is never called for the 2nd pod). **Next step:** a debug
-  `log.Printf` is currently left in `internal/litterbox/litterbox.go` `handle()`
-  — run `neko up` + apply `examples/deployment.toml`, read which `event
-  type/pod/phase` lines actually arrive, and compare against the store's watch
-  publish path (`internal/store/store.go` `publish`/`Watch`). Suspect the store
-  `Watch` replay+tail hand-off or slow-consumer drop. **Remove that debug line**
-  once resolved.
+_None._
+
+## Resolved issues
+
+- **Litterbox started only 1 of N deployment pods on initial apply — FIXED
+  2026-11-20.** Root cause (diagnosed with a red-capable test, not the store
+  path the old note suspected): the litterbox keyed its per-pod `busy` and
+  `sandboxes` maps by `pod.Meta.UID`, but the replicaset controller creates pods
+  with **no UID** (`internal/controller/replicaset.createPod` never sets it). So
+  every replica collided on the empty-string key `""` — pod #2's reconcile saw
+  `busy[""]`/`sandboxes[""]` already set and returned early, starting only one
+  sandbox. (The earlier "per-UID busy guard" wasn't a failed fix — it *was* the
+  bug.) **Fix:** key by namespace/name (the store identity, always unique) via
+  `internal/litterbox.podKey`. Regression test `litterbox_test.go`
+  `TestPodKeyDistinctForReplicas` goes red on UID keying, green on the fix.
+  Verified end to end: `neko apply examples/deployment.toml` (`replicas=2`) →
+  **both** `web-rs-0` (10.244.0.3) and `web-rs-1` (10.244.0.2) reach Running on
+  the first apply, two real nginx containers in the node. Debug line removed.
+
 
 ## Phase: Design
 
@@ -165,22 +168,55 @@ synthesize") at `opus high`, per `~/.claude/rules/pstack-models.md`.
         `neko apply`/`get` round-trip host→node → **CRI smoke passes on our own
         node** (`CRI SMOKE OK`: sandbox→container→teardown). Added `sigs.k8s.io/kind`.
 
-### Known blocker (M4) — RESOLVED via kind provisioning (D11)
-**Resolved 2026-10-31.** `neko up` now delegates node provisioning to kind's Go
-library (`cluster.Create` + `CreateWithStopBeforeSettingUpKubernetes(true)`):
-kind builds the kindest/node container correctly (the overlay/containerd/mount
-setup our hand-rolled `docker run` couldn't replicate) and stops before kubeadm;
-we install the CNI conflist, copy the `neko` binary in, and launch
-`neko node-agent`. **Verified end to end:** `neko up` (~8s) → agent healthy on
-the published host port → `neko apply examples/pod.toml` → Pod created, AND the
-CRI smoke (`hack/crismoke.go`) now prints `CRI SMOKE OK` on our own node
-(sandbox→container→teardown). The container runtime path works.
+### Node provisioning (M4) — EINVAL ROOT-CAUSED; kind dependency now removable
+**Resolved + root-caused 2026-11-20.** The `failed to mount rootfs component:
+invalid argument` (EINVAL) blocker that forced the kind-library detour is now
+fully understood. A controlled diff experiment — a kind-provisioned node (A) vs.
+a plain `docker run kindest/node:v1.33.1` with kind's exact flags (B), identical
+image and containerd (v2.1.1) — pinned a **single cause: overlay-on-overlay.**
 
-Tracked follow-up (not required for M1): remove the kind dependency with a
-self-contained bring-up once the overlay-snapshotter provisioning gap is
-understood. Diagnosis + disproven hypotheses retained below for that effort.
+- **Node A:** `/var/lib/containerd` is on **ext4** (kind mounts a Docker volume
+  at `/var`: `/dev/vda1[…/volumes/…]`). `crictl runp` → `SANDBOX_READY`.
+- **Node B (plain run):** `/var/lib/containerd` is on the container's own
+  **overlayfs** rootfs. containerd's overlay snapshotter can't build an overlay
+  whose upper/work dirs sit on another overlayfs → EINVAL. `crictl runp` fails
+  at the rootfs mount.
+- **Proven fix:** add **`--volume <vol>:/var`** (an ext4-backed Docker volume)
+  to the `docker run`. Node B then reaches `SANDBOX_READY`, identical to kind.
+  `/var/lib/containerd` flips `overlayfs` → `ext2/ext3`.
 
-### Historical diagnosis (kept for the self-contained-bringup follow-up)
+The fix is **declarative (one mount)**, not something kind does imperatively at
+`cluster.Create` time — so the `sigs.k8s.io/kind` dependency is removable.
+
+**DONE 2026-11-20 — kind dependency removed, owned node image shipped.**
+- New **`images/node/Dockerfile`** (`FROM kindest/node:v1.33.1`, linux/arm64):
+  a Go builder stage bakes the `neko` binary to `/usr/local/bin/neko`; bakes the
+  default CNI conflist; a `neko-bpf-prep.service` systemd unit mounts bpffs +
+  creates the `/sys/fs/bpf/neko` pin dir at boot (no BPF program loaded yet —
+  deferred). Built via `make node-image` → `neko-box/node:v1.33.1`.
+- **`internal/node/node.go`** rewritten: `docker run` via `os/exec` (kind's
+  exact flags + `--volume <name>-var:/var`), a containerd-readiness poll, CNI
+  install, optional `--neko-bin` overlay, `node-agent` launch. `Down` removes
+  the container and the `/var` volume (idempotent). `sigs.k8s.io/kind` dropped
+  from `go.mod` (`go mod tidy` pruned ~10 indirects); `go build`/`vet`/`test`
+  all green, zero kind refs in the module graph.
+- **Verified end to end on the owned image:** `make node-image` → `neko up`
+  (plain `docker run`, no kind) → `/var/lib/containerd` is **ext4** (the fix;
+  EINVAL gone) → agent healthy (`/v1/healthz` 200) → `neko apply
+  examples/pod.toml` → pod reaches **`phase=Running podIP=10.244.0.2`** with a
+  real `nginx:alpine` container (crictl: sandbox Ready, container Running) →
+  `neko down` removes container **and** volume.
+- Known cosmetic gap (pre-existing, out of scope): `neko get pod` renders a
+  generic NAMESPACE/NAME/REVISION table and doesn't surface phase/IP; the raw
+  store object is correct (`/v1/Pod/...` shows `Running`/`10.244.0.2`).
+
+### Historical diagnosis (SUPERSEDED by the 2026-11-20 root-cause above)
+The notes below predate the diff experiment and are kept only for provenance.
+The residual "some difference in how containerd's overlayfs *snapshotter* mounts
+inside our bare-booted container" **was** exactly the overlay-on-overlay at
+`/var/lib/containerd`; the fix is the ext4 `/var` volume. Do not re-run the
+disproven hypotheses (cgroup driver, image/containerd version, layer depth, rro,
+userxattr, metacopy).
 - **A CRI sandbox's pause task won't stay running in our bare-booted node.**
   `RunPodSandbox` creates the sandbox record, CNI succeeds (netns + IP
   `10.244.0.2` confirmed in containerd debug logs), but the pause **task** exits
