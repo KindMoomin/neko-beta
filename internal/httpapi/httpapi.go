@@ -37,6 +37,8 @@ func New(s *store.Store, ro *observ.Rollup) *Server {
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/healthz", s.healthz)
+	// Latency: literal segments beat the {kind} wildcard in Go 1.22 routing.
+	mux.HandleFunc("GET /v1/latency/service/{ns}/{name}", s.latencyService)
 	mux.HandleFunc("GET /v1/{kind}", s.listOrWatch) // ?watch=1 switches to SSE
 	mux.HandleFunc("GET /v1/{kind}/{ns}/{name}", s.get)
 	mux.HandleFunc("POST /v1/{kind}/{ns}", s.create)
@@ -49,6 +51,25 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 	// ready:true is meaningful only after WAL replay; New returns a store whose
 	// replay already completed, so if we're serving we're ready.
 	writeJSON(w, http.StatusOK, map[string]any{"ready": true, "revision": s.store.CurrentRevision()})
+}
+
+// latencyService serves the RTT rollup for a Service. 503 if the dataplane
+// isn't loaded (no rollup), 404 if there are no samples for it yet.
+func (s *Server) latencyService(w http.ResponseWriter, r *http.Request) {
+	if s.observ == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "latency observability not enabled (no dataplane)"})
+		return
+	}
+	stat, ok := s.observ.ForService(r.PathValue("ns"), r.PathValue("name"))
+	if !ok {
+		http.Error(w, "no latency samples for this service", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"p50Micros": stat.P50Micros,
+		"p95Micros": stat.P95Micros,
+		"samples":   stat.Samples,
+	})
 }
 
 // listResponse is the envelope for a collection.

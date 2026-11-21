@@ -15,8 +15,13 @@
 docs/
 examples/
 hack/
-bpf/
 README.md
+
+# bpf/ source IS needed by the C eBPF build stage (bpf/rtt/*.c, *.h,
+# bpf/include/vmlinux.h). Exclude only the non-source bits; *.o is already
+# excluded above.
+bpf/**/README.md
+bpf/**/*.todo
 
 # images/ is excluded from the Go builder context, but the final stage COPYs
 # two files from images/node/ — allow just those back in.

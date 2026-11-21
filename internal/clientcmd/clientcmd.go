@@ -147,6 +147,46 @@ func (c *Client) Logs(ctx context.Context, ns, pod string) error {
 	return fmt.Errorf("logs: not implemented until the kubelet/cri path lands")
 }
 
+// Latency fetches and renders the RTT latency summary for a Service.
+func (c *Client) Latency(ctx context.Context, ns, name string) error {
+	if ns == "" {
+		ns = "default"
+	}
+	u := fmt.Sprintf("%s/v1/latency/service/%s/%s", c.base, ns, name)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		fmt.Fprintf(c.out, "service/%s: no latency samples yet\n", name)
+		return nil
+	}
+	if resp.StatusCode >= 300 {
+		return httpError(resp)
+	}
+	var lat struct {
+		P50Micros uint32 `json:"p50Micros"`
+		P95Micros uint32 `json:"p95Micros"`
+		Samples   uint64 `json:"samples"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&lat); err != nil {
+		return err
+	}
+	fmt.Fprintf(c.out, "service/%s  p50=%s  p95=%s  samples=%d\n",
+		name, micros(lat.P50Micros), micros(lat.P95Micros), lat.Samples)
+	return nil
+}
+
+// micros renders microseconds as a short human string (us or ms).
+func micros(us uint32) string {
+	if us < 1000 {
+		return fmt.Sprintf("%dµs", us)
+	}
+	return fmt.Sprintf("%.1fms", float64(us)/1000)
+}
+
 // --- internals -------------------------------------------------------------
 
 // kindAliases maps lowercase user input (singular, plural, and common short

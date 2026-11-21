@@ -10,9 +10,10 @@
 #   docker buildx build --platform linux/arm64 -t neko-box/node:v1.33.1 \
 #       -f images/node/Dockerfile .
 #
-# Deferred (see docs/PLAN-ebpf-cni.md): baking the compiled RTT .o to
-# /opt/neko/bpf/rtt.o and loading any BPF program. This image only PREPS the
-# eBPF runtime (bpffs + pin dir); it does not yet ship or load a program.
+# The RTT eBPF object is a neko-box-owned C kprobe on tcp_rcv_established
+# (bpf/rtt/rtt.bpf.c), baked to /opt/neko/bpf/rtt.o. The Go loader
+# (internal/nekonet) loads it at runtime and attaches it via kprobe. A systemd
+# unit preps the eBPF runtime (bpffs + pin dir) at boot.
 
 # --- Stage A: build the linux/arm64 neko binary -----------------------------
 FROM golang:1.26 AS build
@@ -23,7 +24,21 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o /out/neko ./cmd/neko
 
-# --- Stage B: the node image ------------------------------------------------
+# --- Stage B: build the RTT eBPF object (C, CO-RE) --------------------------
+# clang compiles bpf/rtt/rtt.bpf.c for the bpf target against a committed
+# vmlinux.h; CO-RE relocates field offsets against the node kernel's BTF at
+# load time. libbpf-dev supplies bpf_helpers.h / bpf_core_read.h / bpf_tracing.h.
+FROM debian:bookworm-slim AS bpf
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      clang llvm libbpf-dev && \
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY bpf/ ./bpf/
+RUN mkdir -p /out && clang -target bpf -D__TARGET_ARCH_arm64 -mcpu=v3 -g -O2 \
+      -I bpf/include -I bpf/rtt \
+      -c bpf/rtt/rtt.bpf.c -o /out/rtt.o
+
+# --- Stage C: the node image ------------------------------------------------
 FROM kindest/node:v1.33.1
 
 # The baked default neko binary. `neko up --neko-bin` can overlay a fresh build.
@@ -35,10 +50,12 @@ COPY --from=build /out/neko /usr/local/bin/neko
 # baking it means the common case needs no runtime write.
 COPY images/node/10-neko.conflist /etc/cni/net.d/10-neko.conflist
 
+# The RTT eBPF object (neko-box's C kprobe), loaded by internal/nekonet at
+# runtime. Program symbol `neko_rtt`, ringbuf map `RTT_EVENTS`.
+RUN mkdir -p /opt/neko/bpf
+COPY --from=bpf /out/rtt.o /opt/neko/bpf/rtt.o
+
 # eBPF runtime prep: a boot-time systemd unit mounts bpffs and creates the pin
 # dir. bpffs can only be mounted at runtime (not at image-build), hence a unit.
-# Reserved baked path for the RTT object (filled by the eBPF phase):
-#   /opt/neko/bpf/rtt.o
-RUN mkdir -p /opt/neko/bpf
 COPY images/node/neko-bpf-prep.service /etc/systemd/system/neko-bpf-prep.service
 RUN systemctl enable neko-bpf-prep.service

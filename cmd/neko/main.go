@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -31,7 +32,9 @@ import (
 	"github.com/neko-box/neko/internal/cri"
 	"github.com/neko-box/neko/internal/httpapi"
 	"github.com/neko-box/neko/internal/litterbox"
+	"github.com/neko-box/neko/internal/nekonet"
 	"github.com/neko-box/neko/internal/node"
+	"github.com/neko-box/neko/internal/observ"
 	"github.com/neko-box/neko/internal/store"
 )
 
@@ -108,6 +111,10 @@ func runNodeAgent(ctx context.Context, args []string) error {
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// RTT latency rollup. Served read-only via httpapi; fed by the eBPF
+	// dataplane below when the node is reachable.
+	ro := observ.New(acc)
+
 	// Litterbox (neko's minimal kubelet) + placement, if a CRI endpoint is
 	// reachable. Optional so the agent can serve API-only on a host without
 	// containerd (e.g. for testing).
@@ -123,6 +130,28 @@ func runNodeAgent(ctx context.Context, args []string) error {
 				}()
 				go runBinder(ctx, acc, *nodeName) // trivial placement (D5)
 				log.Printf("litterbox running (node=%s, cri=%s)", *nodeName, *criEndpoint)
+
+				// eBPF RTT dataplane: load the baked sock_ops program, attach it
+				// to the node cgroup, drain samples into the rollup. Best-effort:
+				// a load failure must not stop the agent (API/litterbox serve on).
+				dp := &nekonet.Dataplane{}
+				if derr := dp.Load(ctx); derr != nil {
+					log.Printf("RTT dataplane not loaded: %v", derr)
+				} else {
+					log.Printf("RTT dataplane loaded (kprobe tcp_rcv_established)")
+					samples := make(chan nekonet.Sample, 256)
+					go func() {
+						if rerr := dp.ReadRTT(ctx, samples); rerr != nil && ctx.Err() == nil {
+							log.Printf("RTT reader stopped: %v", rerr)
+						}
+					}()
+					go func() {
+						for s := range samples {
+							ro.Ingest(s)
+						}
+					}()
+					go func() { <-ctx.Done(); dp.Close() }()
+				}
 			} else {
 				log.Printf("CRI unreachable (%v); serving API only", verr)
 			}
@@ -143,7 +172,7 @@ func runNodeAgent(ctx context.Context, args []string) error {
 		}
 	}()
 
-	srv := &http.Server{Addr: *addr, Handler: httpapi.New(st, nil).Routes()}
+	srv := &http.Server{Addr: *addr, Handler: httpapi.New(st, ro).Routes()}
 	go func() {
 		<-ctx.Done()
 		sc, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -253,7 +282,17 @@ func runClient(ctx context.Context, verb string, args []string) error {
 			return fmt.Errorf("usage: neko logs <pod> [-n ns]")
 		}
 		return c.Logs(ctx, *ns, rest[0])
-	case "import", "latency", "snapshot", "restore":
+	case "latency":
+		// usage: neko latency service/<name> [-n ns]
+		if len(rest) != 1 {
+			return fmt.Errorf("usage: neko latency service/<name> [-n ns]")
+		}
+		kind, name, found := strings.Cut(rest[0], "/")
+		if !found || kind != "service" {
+			return fmt.Errorf("usage: neko latency service/<name> [-n ns]")
+		}
+		return c.Latency(ctx, *ns, name)
+	case "import", "snapshot", "restore":
 		return fmt.Errorf("%s: not implemented yet (see docs/PROGRESS.md)", verb)
 	default:
 		return fmt.Errorf("unknown client verb %q", verb)
